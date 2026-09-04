@@ -25,6 +25,7 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 #include "tjpgd.h"
+#include "teal_ball_color.h"
 
 #define CAM_W 640
 #define CAM_H 480
@@ -421,16 +422,6 @@ static bool decode_jpeg(const uint8_t *data, size_t size)
     return jd_decomp(&decoder, jpeg_output, 1) == JDR_OK;
 }
 
-static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
-{
-    int red = r;
-    return red >= RED_R_MIN &&
-           red - (int)g >= RED_RG_MIN_DIFF &&
-           red - (int)b >= RED_RB_MIN_DIFF &&
-           red * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
-           red * 100 >= (int)b * RED_DOMINANCE_PERCENT;
-}
-
 static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     int blue = b;
@@ -439,6 +430,20 @@ static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
            blue - (int)g >= BLUE_BG_MIN_DIFF &&
            blue * 100 >= (int)r * BLUE_DOMINANCE_PERCENT &&
            blue * 100 >= (int)g * BLUE_DOMINANCE_PERCENT;
+}
+
+static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return r >= RED_R_MIN &&
+           (int)r - (int)g >= RED_RG_MIN_DIFF &&
+           (int)r - (int)b >= RED_RB_MIN_DIFF &&
+           (int)r * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
+           (int)r * 100 >= (int)b * RED_DOMINANCE_PERCENT;
+}
+
+static bool is_ball_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return is_red_rgb(r, g, b) || is_teal_ball_rgb(r, g, b);
 }
 
 static blob_t flood_blob(int sx, int sy)
@@ -501,7 +506,7 @@ static blob_t detect_blob(bool red, bool choose_leftmost)
             int p = (y * IMG_W + x) * 3;
             bool selected;
             if (red) {
-                selected = is_red_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
+                selected = is_ball_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
             } else {
                 selected = is_blue_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
             }
