@@ -38,11 +38,11 @@
 #define START_BOOST_FRAMES 1
 #define BASE_PWM 44
 #define START_BOOST_PWM 16
-#define TRACK_DRIVE_FRAMES 1
-#define TRACK_PAUSE_FRAMES 2
+#define TRACK_DRIVE_MS 35
+#define TRACK_PAUSE_MS 15
 #define CORNER_SEARCH_PWM 33
-#define CORNER_SEARCH_TURN_FRAMES 1
-#define CORNER_SEARCH_PAUSE_FRAMES 3
+#define CORNER_SEARCH_TURN_MS 22
+#define CORNER_SEARCH_PAUSE_MS 38
 
 /* Existing motor wiring. */
 #define STBY_PIN 10
@@ -63,7 +63,7 @@
 #define ULTRASONIC_TIMEOUT_US 30000
 #define ULTRASONIC_INTERVAL_MS 50
 #define CAPTURE_NEAR_CM 10.0f
-#define CAPTURE_RELEASE_CM 300.0f
+#define CAPTURE_RELEASE_CM 25.0f
 
 /* Red ball mask thresholds, applied directly to RGB888 pixels. */
 #define RED_R_MIN 80
@@ -79,6 +79,13 @@
 #define BLUE_MIN_AREA 40
 #define BLUE_MAX_AREA 30000
 
+/* Teal ball mask thresholds, applied directly to RGB888 pixels. */
+#define TEAL_BALL_G_MIN 65
+#define TEAL_BALL_B_MIN 65
+#define TEAL_BALL_GR_MIN_DIFF 15
+#define TEAL_BALL_BR_MIN_DIFF 15
+#define TEAL_BALL_DOMINANCE_PERCENT 115
+
 /* Ball and motion tuning. */
 #define BALL_MIN_AREA 90
 #define BALL_MAX_AREA 20000
@@ -89,10 +96,22 @@
 #define GOAL_CENTER_DEADBAND 20
 #define BALL_CONFIRM_FRAMES 5
 #define BALL_LOST_FRAMES 8
-#define CAPTURE_CONFIRM_FRAMES 3
+#define CAPTURE_CONFIRM_FRAMES 1
 #define CAPTURE_TIMEOUT_MS 2500
 #define CAPTURE_MONITOR_MISSES 30
 #define BALL_NEAR_AREA 180
+
+/* Recovery after the ball disappears near the front of the car. */
+#define CAPTURE_RECOVERY_NEAR_CM 15.0f
+#define CAPTURE_RECOVERY_FORWARD_MS 100
+#define CAPTURE_RECOVERY_TURN_PULSES 3
+#define CAPTURE_RECOVERY_TIMEOUT_MS 700
+
+/* Approach-red tuning: longer straight pulses when the ball is far away. */
+#define APPROACH_FAR_DRIVE_MS 80
+#define APPROACH_FAR_PAUSE_MS 15
+/* Conservative threshold: switch to the near/normal pulse early. */
+#define APPROACH_NEAR_AREA 120
 
 #define SEARCH_SWITCH_MS 1200
 #define GOAL_SCAN_SWITCH_MS 1400
@@ -102,6 +121,12 @@
 #define GOAL_NEAR_Y 280
 #define GOAL_PUSH_DURATION_MS 700
 #define GOAL_VERIFY_HOLD_MS 350
+#define RETURN_AFTER_PUSH_MS 5000
+#define RETURN_AFTER_PUSH_TURN_PULSES 250
+
+/* Goal-push tuning: one fixed straight pulse and pause for this state. */
+#define GOAL_PUSH_DRIVE_MS 280
+#define GOAL_PUSH_PAUSE_MS 20
 
 #define FRAME_BUFFERS 3
 #define FRAME_SIZE (CAM_W * CAM_H * 2)
@@ -112,15 +137,29 @@
 
 static const char *TAG = "red_left_goal";
 
-typedef struct { const uint8_t *data; size_t size, pos; } jpeg_src_t;
-typedef struct {
+typedef struct
+{
+    const uint8_t *data;
+    size_t size, pos;
+} jpeg_src_t;
+typedef struct
+{
     bool found;
     int area;
     int cx, cy;
     int min_x, min_y, max_x, max_y;
     float circularity;
 } blob_t;
-typedef struct {
+
+typedef enum
+{
+    BLOB_SELECT_LARGEST,
+    BLOB_SELECT_LEFTMOST,
+    BLOB_SELECT_RIGHTMOST
+} blob_selection_t;
+
+typedef struct
+{
     bool decoded;
     bool found_ball;
     bool found_goal;
@@ -134,17 +173,20 @@ typedef struct {
     float distance_cm;
     char state[24];
 } status_t;
-typedef enum {
+typedef enum
+{
     STATE_IDLE,
     STATE_SEARCH_RED,
     STATE_ALIGN_RED,
     STATE_APPROACH_RED,
+    STATE_CAPTURE_RECOVERY,
     STATE_CAPTURE_RED,
     STATE_FIND_GOAL,
     STATE_GOAL_SCAN,
     STATE_GOAL_ALIGN,
     STATE_GOAL_APPROACH,
     STATE_GOAL_PUSH,
+    STATE_RETURN_AFTER_PUSH,
     STATE_GOAL_VERIFY,
     STATE_ALL_DONE,
     STATE_FAIL_SAFE
@@ -171,27 +213,47 @@ static status_t s_status;
 static state_t s_state = STATE_IDLE;
 static uint32_t s_state_started_ms;
 static bool s_ball_captured;
+static bool s_second_round;
 static int s_capture_monitor_misses;
 static int s_capture_near_frames;
 static int s_last_ball_error;
 
 static const char *state_name(state_t state)
 {
-    switch (state) {
-        case STATE_IDLE: return "IDLE";
-        case STATE_SEARCH_RED: return "SEARCH_RED";
-        case STATE_ALIGN_RED: return "ALIGN_RED";
-        case STATE_APPROACH_RED: return "APPROACH_RED";
-        case STATE_CAPTURE_RED: return "CAPTURE_RED";
-        case STATE_FIND_GOAL: return "FIND_GOAL";
-        case STATE_GOAL_SCAN: return "GOAL_SCAN";
-        case STATE_GOAL_ALIGN: return "GOAL_ALIGN";
-        case STATE_GOAL_APPROACH: return "GOAL_APPROACH";
-        case STATE_GOAL_PUSH: return "GOAL_PUSH";
-        case STATE_GOAL_VERIFY: return "GOAL_VERIFY_DEFAULT_SUCCESS";
-        case STATE_ALL_DONE: return "ALL_DONE";
-        case STATE_FAIL_SAFE: return "FAIL_SAFE";
-        default: return "UNKNOWN";
+    switch (state)
+    {
+    case STATE_IDLE:
+        return "IDLE";
+    case STATE_SEARCH_RED:
+        return "SEARCH_RED";
+    case STATE_ALIGN_RED:
+        return "ALIGN_RED";
+    case STATE_APPROACH_RED:
+        return "APPROACH_RED";
+    case STATE_CAPTURE_RECOVERY:
+        return "CAPTURE_RECOVERY";
+    case STATE_CAPTURE_RED:
+        return "CAPTURE_RED";
+    case STATE_FIND_GOAL:
+        return "FIND_GOAL";
+    case STATE_GOAL_SCAN:
+        return "GOAL_SCAN";
+    case STATE_GOAL_ALIGN:
+        return "GOAL_ALIGN";
+    case STATE_GOAL_APPROACH:
+        return "GOAL_APPROACH";
+    case STATE_GOAL_PUSH:
+        return "GOAL_PUSH";
+    case STATE_RETURN_AFTER_PUSH:
+        return "RETURN_AFTER_PUSH";
+    case STATE_GOAL_VERIFY:
+        return "GOAL_VERIFY_DEFAULT_SUCCESS";
+    case STATE_ALL_DONE:
+        return "ALL_DONE";
+    case STATE_FAIL_SAFE:
+        return "FAIL_SAFE";
+    default:
+        return "UNKNOWN";
     }
 }
 
@@ -207,7 +269,8 @@ static int clampi(int value, int low, int high)
 
 static void enter_state(state_t next)
 {
-    if (s_state == next) return;
+    if (s_state == next)
+        return;
     s_state = next;
     s_state_started_ms = now_ms();
     ESP_LOGI(TAG, "state -> %s", state_name(next));
@@ -216,8 +279,13 @@ static void enter_state(state_t next)
 static void motor_channel_init(ledc_channel_t channel, int pin)
 {
     ledc_channel_config_t config = {
-        .gpio_num = pin, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = channel,
-        .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 0, .hpoint = 0,
+        .gpio_num = pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = channel,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&config));
 }
@@ -233,8 +301,11 @@ static void motors_init(void)
     ESP_ERROR_CHECK(gpio_config(&io));
     gpio_set_level(STBY_PIN, 0);
     const ledc_timer_config_t timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = LEDC_TIMER_0, .freq_hz = 10000, .clk_cfg = LEDC_AUTO_CLK,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 10000,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
     motor_channel_init(LEDC_CHANNEL_0, PWMA_PIN);
@@ -252,7 +323,8 @@ static void set_motor(ledc_channel_t channel, int in1, int in2, int pwm)
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel));
 }
 
-typedef enum {
+typedef enum
+{
     MOTION_NONE,
     MOTION_STRAIGHT,
     MOTION_TURN
@@ -267,7 +339,8 @@ static int s_turn_start_boost_frames;
 
 static void drive_pair(int left, int right)
 {
-    if (!MOTOR_OUTPUT_ENABLED) return;
+    if (!MOTOR_OUTPUT_ENABLED)
+        return;
     gpio_set_level(STBY_PIN, left != 0 || right != 0);
     set_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN, left);
     set_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN, 0);
@@ -287,29 +360,39 @@ static void stop_drive(void)
 
 static void drive_straight_fixed(void)
 {
-    if (!MOTOR_OUTPUT_ENABLED) return;
-    if (s_brake_active) {
+    if (!MOTOR_OUTPUT_ENABLED)
+        return;
+    if (s_brake_active)
+    {
         s_start_boost_frames = START_BOOST_FRAMES;
         s_brake_active = false;
     }
-    if (s_start_boost_frames > 0) {
+    if (s_start_boost_frames > 0)
+    {
         int pwm = BASE_PWM + START_BOOST_PWM;
         s_start_boost_frames--;
         drive_pair(pwm, pwm);
-    } else {
+    }
+    else
+    {
         drive_pair(BASE_PWM, BASE_PWM);
     }
 }
 
 static void drive_turn_pulse(int steering, bool pulse_start)
 {
-    if (!MOTOR_OUTPUT_ENABLED) return;
+    if (!MOTOR_OUTPUT_ENABLED)
+        return;
     int left = steering;
     int right = -steering;
-    if (pulse_start) s_turn_start_boost_frames = START_BOOST_FRAMES;
-    if (s_turn_start_boost_frames > 0) {
-        if (left) left += left > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
-        if (right) right += right > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
+    if (pulse_start)
+        s_turn_start_boost_frames = START_BOOST_FRAMES;
+    if (s_turn_start_boost_frames > 0)
+    {
+        if (left)
+            left += left > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
+        if (right)
+            right += right > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
         s_turn_start_boost_frames--;
     }
     drive_pair(left, right);
@@ -325,7 +408,8 @@ static void brake_motor(ledc_channel_t channel, int in1, int in2)
 
 static void brake_drive(void)
 {
-    if (!MOTOR_OUTPUT_ENABLED) return;
+    if (!MOTOR_OUTPUT_ENABLED)
+        return;
     s_brake_active = true;
     gpio_set_level(STBY_PIN, 1);
     brake_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN);
@@ -336,7 +420,8 @@ static void brake_drive(void)
 static void motion_begin(motion_mode_t mode, int direction)
 {
     if (s_motion_mode != mode ||
-        (mode == MOTION_TURN && s_motion_direction != direction)) {
+        (mode == MOTION_TURN && s_motion_direction != direction))
+    {
         s_motion_mode = mode;
         s_motion_direction = direction;
         s_motion_phase = 0;
@@ -352,30 +437,57 @@ static void motion_stop(void)
     s_motion_phase = 0;
 }
 
-typedef enum {
+typedef enum
+{
     TURN_LEFT = -1,
     TURN_RIGHT = 1
 } turn_direction_t;
 
-/* Public commands. PWM and pulse timing are fixed from the tested programs. */
+/* Public commands. Motion duration is controlled directly in milliseconds. */
 static void command_straight(void)
 {
     motion_begin(MOTION_STRAIGHT, 0);
-    const unsigned cycle = TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES;
-    const unsigned phase = s_motion_phase++ % cycle;
-    if (phase < TRACK_DRIVE_FRAMES) drive_straight_fixed();
-    else brake_drive();
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(TRACK_DRIVE_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(TRACK_PAUSE_MS));
 }
 
 static void command_turn(turn_direction_t direction)
 {
     motion_begin(MOTION_TURN, direction);
-    const unsigned cycle = CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES;
-    const unsigned phase = s_motion_phase++ % cycle;
-    if (phase < CORNER_SEARCH_TURN_FRAMES)
-        drive_turn_pulse(direction * CORNER_SEARCH_PWM, phase == 0);
-    else
-        brake_drive();
+    drive_turn_pulse(direction * CORNER_SEARCH_PWM, true);
+    vTaskDelay(pdMS_TO_TICKS(CORNER_SEARCH_TURN_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(CORNER_SEARCH_PAUSE_MS));
+}
+
+static void command_goal_push(void)
+{
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(GOAL_PUSH_DRIVE_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(GOAL_PUSH_PAUSE_MS));
+}
+
+static void command_approach_red(const blob_t *ball)
+{
+    const bool near = ball && ball->found && ball->area >= APPROACH_NEAR_AREA;
+    const int drive_ms = near ? TRACK_DRIVE_MS : APPROACH_FAR_DRIVE_MS;
+    const int pause_ms = near ? TRACK_PAUSE_MS : APPROACH_FAR_PAUSE_MS;
+
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(drive_ms));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(pause_ms));
+}
+
+static void command_capture_recovery_forward(void)
+{
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(CAPTURE_RECOVERY_FORWARD_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(TRACK_PAUSE_MS));
 }
 
 static void stop_motors(void)
@@ -387,8 +499,10 @@ static size_t jpeg_input(JDEC *jd, uint8_t *buf, size_t len)
 {
     jpeg_src_t *src = jd->device;
     size_t available = src->size - src->pos;
-    if (len > available) len = available;
-    if (buf) memcpy(buf, src->data + src->pos, len);
+    if (len > available)
+        len = available;
+    if (buf)
+        memcpy(buf, src->data + src->pos, len);
     src->pos += len;
     return len;
 }
@@ -398,8 +512,10 @@ static int jpeg_output(JDEC *jd, void *bitmap, JRECT *rect)
     (void)jd;
     uint8_t *src = bitmap;
     const unsigned width = rect->right - rect->left + 1;
-    for (unsigned y = rect->top; y <= rect->bottom && y < IMG_H; ++y) {
-        for (unsigned x = rect->left; x <= rect->right && x < IMG_W; ++x) {
+    for (unsigned y = rect->top; y <= rect->bottom && y < IMG_H; ++y)
+    {
+        for (unsigned x = rect->left; x <= rect->right && x < IMG_W; ++x)
+        {
             unsigned src_index = ((y - rect->top) * width + (x - rect->left)) * 3;
             unsigned dst_index = (y * IMG_W + x) * 3;
             s_rgb[dst_index] = src[src_index];
@@ -416,19 +532,11 @@ static bool decode_jpeg(const uint8_t *data, size_t size)
     JDEC decoder;
     jpeg_src_t source = {.data = data, .size = size, .pos = 0};
     memset(s_rgb, 255, IMG_W * IMG_H * 3);
-    if (jd_prepare(&decoder, jpeg_input, work, sizeof(work), &source) != JDR_OK) return false;
-    if (decoder.width != CAM_W || decoder.height != CAM_H) return false;
+    if (jd_prepare(&decoder, jpeg_input, work, sizeof(work), &source) != JDR_OK)
+        return false;
+    if (decoder.width != CAM_W || decoder.height != CAM_H)
+        return false;
     return jd_decomp(&decoder, jpeg_output, 1) == JDR_OK;
-}
-
-static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
-{
-    int red = r;
-    return red >= RED_R_MIN &&
-           red - (int)g >= RED_RG_MIN_DIFF &&
-           red - (int)b >= RED_RB_MIN_DIFF &&
-           red * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
-           red * 100 >= (int)b * RED_DOMINANCE_PERCENT;
 }
 
 static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
@@ -441,87 +549,138 @@ static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
            blue * 100 >= (int)g * BLUE_DOMINANCE_PERCENT;
 }
 
+static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return r >= RED_R_MIN &&
+           (int)r - (int)g >= RED_RG_MIN_DIFF &&
+           (int)r - (int)b >= RED_RB_MIN_DIFF &&
+           (int)r * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
+           (int)r * 100 >= (int)b * RED_DOMINANCE_PERCENT;
+}
+
+static bool is_teal_ball_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return g >= TEAL_BALL_G_MIN &&
+           b >= TEAL_BALL_B_MIN &&
+           (int)g - (int)r >= TEAL_BALL_GR_MIN_DIFF &&
+           (int)b - (int)r >= TEAL_BALL_BR_MIN_DIFF &&
+           (int)g * 100 >= (int)r * TEAL_BALL_DOMINANCE_PERCENT &&
+           (int)b * 100 >= (int)r * TEAL_BALL_DOMINANCE_PERCENT;
+}
+
 static blob_t flood_blob(int sx, int sy)
 {
     blob_t out = {.min_x = IMG_W, .min_y = IMG_H, .max_x = -1, .max_y = -1};
     int start = sy * IMG_W + sx;
-    if (s_mask[start] != 1) return out;
+    if (s_mask[start] != 1)
+        return out;
     size_t head = 0, tail = 0;
     int sum_x = 0, sum_y = 0;
     s_mask[start] = 2;
     s_flood_queue[tail++] = (uint32_t)start;
-    while (head < tail) {
+    while (head < tail)
+    {
         int p = (int)s_flood_queue[head++];
         int x = p % IMG_W, y = p / IMG_W;
         out.area++;
-        sum_x += x; sum_y += y;
-        if (x < out.min_x) out.min_x = x;
-        if (x > out.max_x) out.max_x = x;
-        if (y < out.min_y) out.min_y = y;
-        if (y > out.max_y) out.max_y = y;
+        sum_x += x;
+        sum_y += y;
+        if (x < out.min_x)
+            out.min_x = x;
+        if (x > out.max_x)
+            out.max_x = x;
+        if (y < out.min_y)
+            out.min_y = y;
+        if (y > out.max_y)
+            out.max_y = y;
         const int nx[4] = {x - 1, x + 1, x, x};
         const int ny[4] = {y, y, y - 1, y + 1};
-        for (int i = 0; i < 4; ++i) {
-            if (nx[i] < 0 || nx[i] >= IMG_W || ny[i] < 0 || ny[i] >= IMG_H) continue;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (nx[i] < 0 || nx[i] >= IMG_W || ny[i] < 0 || ny[i] >= IMG_H)
+                continue;
             int np = ny[i] * IMG_W + nx[i];
-            if (s_mask[np] == 1) {
+            if (s_mask[np] == 1)
+            {
                 s_mask[np] = 2;
                 s_flood_queue[tail++] = (uint32_t)np;
             }
         }
     }
-    if (out.area > 0) {
+    if (out.area > 0)
+    {
         out.cx = sum_x / out.area;
         out.cy = sum_y / out.area;
         int perimeter = 0;
-        for (size_t i = 0; i < tail; ++i) {
+        for (size_t i = 0; i < tail; ++i)
+        {
             int p = (int)s_flood_queue[i];
             int x = p % IMG_W, y = p / IMG_W;
             const int nx[4] = {x - 1, x + 1, x, x};
             const int ny[4] = {y, y, y - 1, y + 1};
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 4; ++j)
+            {
                 if (nx[j] < 0 || nx[j] >= IMG_W || ny[j] < 0 || ny[j] >= IMG_H ||
-                    s_mask[ny[j] * IMG_W + nx[j]] != 2) {
+                    s_mask[ny[j] * IMG_W + nx[j]] != 2)
+                {
                     perimeter++;
                 }
             }
         }
         out.circularity = perimeter > 0
-            ? (float)(4.0 * M_PI * out.area / ((double)perimeter * perimeter))
-            : 0.0f;
+                              ? (float)(4.0 * M_PI * out.area / ((double)perimeter * perimeter))
+                              : 0.0f;
     }
     return out;
 }
 
-static blob_t detect_blob(bool red, bool choose_leftmost)
+static blob_t detect_blob(bool red, blob_selection_t selection)
 {
     memset(s_mask, 0, IMG_W * IMG_H);
-    for (int y = 0; y < IMG_H; ++y) {
-        for (int x = 0; x < IMG_W; ++x) {
+    for (int y = 0; y < IMG_H; ++y)
+    {
+        for (int x = 0; x < IMG_W; ++x)
+        {
             int p = (y * IMG_W + x) * 3;
             bool selected;
-            if (red) {
-                selected = is_red_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
-            } else {
+            if (red)
+            {
+                selected = s_second_round
+                               ? is_teal_ball_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2])
+                               : is_red_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
+            }
+            else
+            {
                 selected = is_blue_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
             }
             s_mask[y * IMG_W + x] = selected ? 1 : 0;
         }
     }
     blob_t best = {.min_x = IMG_W, .min_y = IMG_H, .max_x = -1, .max_y = -1};
-    for (int y = 0; y < IMG_H; ++y) {
-        for (int x = 0; x < IMG_W; ++x) {
-            if (s_mask[y * IMG_W + x] != 1) continue;
+    for (int y = 0; y < IMG_H; ++y)
+    {
+        for (int x = 0; x < IMG_W; ++x)
+        {
+            if (s_mask[y * IMG_W + x] != 1)
+                continue;
             blob_t candidate = flood_blob(x, y);
             int min_area = red ? BALL_MIN_AREA : BLUE_MIN_AREA;
             int max_area = red ? BALL_MAX_AREA : BLUE_MAX_AREA;
-            if (candidate.area < min_area || candidate.area > max_area) continue;
-            if (red && candidate.circularity < CIRCULARITY_THRESH) continue;
+            if (candidate.area < min_area || candidate.area > max_area)
+                continue;
+            if (red && candidate.circularity < CIRCULARITY_THRESH)
+                continue;
             bool better = false;
-            if (!best.found) better = true;
-            else if (choose_leftmost) better = candidate.cx < best.cx;
-            else better = candidate.area > best.area;
-            if (better) {
+            if (!best.found)
+                better = true;
+            else if (selection == BLOB_SELECT_LEFTMOST)
+                better = candidate.cx < best.cx;
+            else if (selection == BLOB_SELECT_RIGHTMOST)
+                better = candidate.cx > best.cx;
+            else
+                better = candidate.area > best.area;
+            if (better)
+            {
                 candidate.found = true;
                 best = candidate;
             }
@@ -532,10 +691,13 @@ static blob_t detect_blob(bool red, bool choose_leftmost)
 
 static void publish_jpeg(const uvc_host_frame_t *frame)
 {
-    if (!frame || !frame->data || frame->data_len < 4 || frame->data_len > FRAME_SIZE) return;
+    if (!frame || !frame->data || frame->data_len < 4 || frame->data_len > FRAME_SIZE)
+        return;
     if (frame->data[0] != 0xff || frame->data[1] != 0xd8 ||
-        frame->data[frame->data_len - 2] != 0xff || frame->data[frame->data_len - 1] != 0xd9) return;
-    if (xSemaphoreTake(s_jpeg_lock, pdMS_TO_TICKS(10)) != pdPASS) return;
+        frame->data[frame->data_len - 2] != 0xff || frame->data[frame->data_len - 1] != 0xd9)
+        return;
+    if (xSemaphoreTake(s_jpeg_lock, pdMS_TO_TICKS(10)) != pdPASS)
+        return;
     int next = s_jpeg_index ^ 1;
     memcpy(s_jpeg_buffers[next], frame->data, frame->data_len);
     s_jpeg_sizes[next] = frame->data_len;
@@ -546,7 +708,8 @@ static void publish_jpeg(const uvc_host_frame_t *frame)
 
 static void update_status(bool decoded, blob_t ball, blob_t goal)
 {
-    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(10)) != pdPASS) return;
+    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(10)) != pdPASS)
+        return;
     s_status.decoded = decoded;
     s_status.found_ball = ball.found;
     s_status.found_goal = goal.found;
@@ -580,12 +743,16 @@ static bool read_ultrasonic(float *distance_cm)
     esp_rom_delay_us(10);
     gpio_set_level(TRIG_PIN, 0);
     int64_t start = esp_timer_get_time();
-    while (gpio_get_level(ECHO_PIN) == 0) {
-        if (esp_timer_get_time() - start >= ULTRASONIC_TIMEOUT_US) return false;
+    while (gpio_get_level(ECHO_PIN) == 0)
+    {
+        if (esp_timer_get_time() - start >= ULTRASONIC_TIMEOUT_US)
+            return false;
     }
     int64_t echo_start = esp_timer_get_time();
-    while (gpio_get_level(ECHO_PIN) != 0) {
-        if (esp_timer_get_time() - echo_start >= ULTRASONIC_TIMEOUT_US) return false;
+    while (gpio_get_level(ECHO_PIN) != 0)
+    {
+        if (esp_timer_get_time() - echo_start >= ULTRASONIC_TIMEOUT_US)
+            return false;
     }
     uint32_t duration = (uint32_t)(esp_timer_get_time() - echo_start);
     *distance_cm = clampi((int)(duration * 0.0343f / 2.0f), 0, (int)MAX_DISTANCE_CM);
@@ -600,11 +767,17 @@ static void ultrasonic_task(void *arg)
     io.pin_bit_mask = 1ULL << ECHO_PIN;
     io.mode = GPIO_MODE_INPUT;
     ESP_ERROR_CHECK(gpio_config(&io));
-    while (true) {
+    while (true)
+    {
         float total = 0.0f, sample = 0.0f;
         int valid = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (read_ultrasonic(&sample)) { total += sample; valid++; }
+        for (int i = 0; i < 3; ++i)
+        {
+            if (read_ultrasonic(&sample))
+            {
+                total += sample;
+                valid++;
+            }
             vTaskDelay(pdMS_TO_TICKS(8));
         }
         s_distance_valid = valid > 0;
@@ -616,16 +789,22 @@ static void ultrasonic_task(void *arg)
 
 static void update_capture_monitor(void)
 {
-    if (!s_ball_captured || s_state == STATE_GOAL_PUSH || s_state == STATE_GOAL_VERIFY ||
-        s_state == STATE_ALL_DONE) return;
-    if (s_distance_valid && s_distance_cm > CAPTURE_RELEASE_CM) {
+    if (!s_ball_captured || s_state == STATE_GOAL_PUSH ||
+        s_state == STATE_RETURN_AFTER_PUSH || s_state == STATE_GOAL_VERIFY ||
+        s_state == STATE_ALL_DONE)
+        return;
+    if (s_distance_valid && s_distance_cm > CAPTURE_RELEASE_CM)
+    {
         s_capture_monitor_misses++;
         if (s_capture_monitor_misses == 1)
             ESP_LOGW(TAG, "captured ball distance became %.1f cm", s_distance_cm);
-    } else {
+    }
+    else
+    {
         s_capture_monitor_misses = 0;
     }
-    if (s_capture_monitor_misses >= CAPTURE_MONITOR_MISSES) {
+    if (s_capture_monitor_misses >= CAPTURE_MONITOR_MISSES)
+    {
         stop_motors();
         ESP_LOGE(TAG, "captured ball monitoring failed");
         enter_state(STATE_FAIL_SAFE);
@@ -637,198 +816,338 @@ static void run_controller(bool decoded, blob_t ball, blob_t goal)
     const uint32_t elapsed = now_ms() - s_state_started_ms;
     const float distance = s_distance_cm;
     update_capture_monitor();
-    if (s_state == STATE_FAIL_SAFE) { stop_motors(); return; }
+    if (s_state == STATE_FAIL_SAFE)
+    {
+        stop_motors();
+        return;
+    }
 
-    switch (s_state) {
-        case STATE_IDLE:
-            s_ball_captured = false;
+    switch (s_state)
+    {
+    case STATE_IDLE:
+        s_ball_captured = false;
+        s_second_round = false;
+        s_capture_monitor_misses = 0;
+        enter_state(STATE_SEARCH_RED);
+        break;
+
+    case STATE_SEARCH_RED:
+    {
+        static int seen = 0;
+        static int scan_dir = -1; /* Start searching toward the left goal side. */
+        if (ball.found)
+        {
+            if (++seen >= BALL_CONFIRM_FRAMES)
+            {
+                seen = 0;
+                stop_motors();
+                enter_state(STATE_ALIGN_RED);
+            }
+            else
+                stop_motors();
+        }
+        else
+        {
+            seen = 0;
+            if (elapsed >= SEARCH_SWITCH_MS)
+            {
+                scan_dir = -scan_dir;
+                enter_state(STATE_CAPTURE_RECOVERY);
+                break;
+            }
+            command_turn(scan_dir < 0 ? TURN_LEFT : TURN_RIGHT);
+        }
+        break;
+    }
+
+    case STATE_ALIGN_RED:
+    {
+        static int aligned_frames = 0;
+        if (!ball.found)
+        {
+            aligned_frames = 0;
+            stop_motors();
+            if (elapsed >= BALL_LOST_FRAMES * 40)
+                enter_state(STATE_SEARCH_RED);
+            break;
+        }
+        s_last_ball_error = ball.cx - BALL_TARGET_X;
+        if (abs(s_last_ball_error) <= BALL_CENTER_DEADBAND)
+        {
+            ESP_LOGI(TAG, "ALIGN_RED: centered ball_x=%d error=%d -> stop (%d/%d)",
+                     ball.cx, s_last_ball_error, aligned_frames + 1,
+                     BALL_ALIGN_CONFIRM_FRAMES);
+            stop_motors();
+            if (++aligned_frames >= BALL_ALIGN_CONFIRM_FRAMES)
+            {
+                aligned_frames = 0;
+                enter_state(STATE_APPROACH_RED);
+                command_approach_red(&ball);
+            }
+        }
+        else
+        {
+            aligned_frames = 0;
+            turn_direction_t direction =
+                s_last_ball_error > 0 ? TURN_RIGHT : TURN_LEFT;
+            ESP_LOGI(TAG, "ALIGN_RED: ball_x=%d error=%d -> %s pulse",
+                     ball.cx, s_last_ball_error,
+                     direction == TURN_RIGHT ? "RIGHT" : "LEFT");
+            command_turn(direction);
+        }
+        break;
+    }
+
+    case STATE_APPROACH_RED:
+        if (!ball.found)
+        {
+            stop_motors();
+            enter_state(STATE_CAPTURE_RECOVERY);
+            break;
+        }
+        s_last_ball_error = ball.cx - BALL_TARGET_X;
+        if (ball.area >= BALL_NEAR_AREA)
+        {
+            enter_state(STATE_CAPTURE_RED);
+            command_approach_red(&ball);
+        }
+        else
+        {
+            if (abs(s_last_ball_error) <= BALL_CENTER_DEADBAND)
+                command_approach_red(&ball);
+            else
+                command_turn(s_last_ball_error > 0 ? TURN_RIGHT : TURN_LEFT);
+        }
+        break;
+
+    case STATE_CAPTURE_RECOVERY:
+    {
+        if (ball.found)
+        {
+            stop_motors();
+            enter_state(STATE_APPROACH_RED);
+            break;
+        }
+
+        if (s_distance_valid && distance <= CAPTURE_RECOVERY_NEAR_CM)
+        {
+            stop_motors();
+            s_capture_near_frames = 0;
+            s_ball_captured = true;
             s_capture_monitor_misses = 0;
+            ESP_LOGI(TAG, "capture recovery: ultrasonic=%.1f cm -> FIND_GOAL", distance);
+            enter_state(STATE_FIND_GOAL);
+            break;
+        }
+        s_capture_near_frames = 0;
+
+        const uint32_t scan_cycle_ms = CORNER_SEARCH_TURN_MS + CORNER_SEARCH_PAUSE_MS;
+        const uint32_t side_scan_ms = CAPTURE_RECOVERY_TURN_PULSES * scan_cycle_ms;
+        if (elapsed < CAPTURE_RECOVERY_FORWARD_MS)
+        {
+            command_capture_recovery_forward();
+        }
+        else if (elapsed < CAPTURE_RECOVERY_FORWARD_MS + side_scan_ms)
+        {
+            command_turn(TURN_LEFT);
+        }
+        else if (elapsed < CAPTURE_RECOVERY_FORWARD_MS + side_scan_ms * 2)
+        {
+            command_turn(TURN_RIGHT);
+        }
+        else if (elapsed >= CAPTURE_RECOVERY_TIMEOUT_MS)
+        {
+            stop_motors();
+            ESP_LOGW(TAG, "capture recovery timeout -> SEARCH_RED");
             enter_state(STATE_SEARCH_RED);
-            break;
-
-        case STATE_SEARCH_RED: {
-            static int seen = 0;
-            static int scan_dir = -1; /* Start searching toward the left goal side. */
-            if (ball.found) {
-                if (++seen >= BALL_CONFIRM_FRAMES) {
-                    seen = 0;
-                    stop_motors();
-                    enter_state(STATE_ALIGN_RED);
-                } else stop_motors();
-            } else {
-                seen = 0;
-                if (elapsed >= SEARCH_SWITCH_MS) {
-                    scan_dir = -scan_dir;
-                    s_state_started_ms = now_ms();
-                }
-                command_turn(scan_dir < 0 ? TURN_LEFT : TURN_RIGHT);
-            }
-            break;
         }
-
-        case STATE_ALIGN_RED: {
-            static int aligned_frames = 0;
-            if (!ball.found) {
-                aligned_frames = 0;
-                stop_motors();
-                if (elapsed >= BALL_LOST_FRAMES * 40) enter_state(STATE_SEARCH_RED);
-                break;
-            }
-            s_last_ball_error = ball.cx - BALL_TARGET_X;
-            if (abs(s_last_ball_error) <= BALL_CENTER_DEADBAND) {
-                ESP_LOGI(TAG, "ALIGN_RED: centered ball_x=%d error=%d -> stop (%d/%d)",
-                         ball.cx, s_last_ball_error, aligned_frames + 1,
-                         BALL_ALIGN_CONFIRM_FRAMES);
-                stop_motors();
-                if (++aligned_frames >= BALL_ALIGN_CONFIRM_FRAMES) {
-                    aligned_frames = 0;
-                    enter_state(STATE_APPROACH_RED);
-                    command_straight();
-                }
-            } else {
-                aligned_frames = 0;
-                turn_direction_t direction =
-                    s_last_ball_error > 0 ? TURN_RIGHT : TURN_LEFT;
-                ESP_LOGI(TAG, "ALIGN_RED: ball_x=%d error=%d -> %s pulse",
-                         ball.cx, s_last_ball_error,
-                         direction == TURN_RIGHT ? "RIGHT" : "LEFT");
-                command_turn(direction);
-            }
-            break;
+        else
+        {
+            stop_motors();
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
+        break;
+    }
 
-        case STATE_APPROACH_RED:
-            if (!ball.found) {
-                stop_motors();
-                if (s_distance_valid && distance <= CAPTURE_NEAR_CM) enter_state(STATE_CAPTURE_RED);
-                else if (elapsed >= BALL_LOST_FRAMES * 40) enter_state(STATE_SEARCH_RED);
-                break;
-            }
-            s_last_ball_error = ball.cx - BALL_TARGET_X;
-            if (ball.area >= BALL_NEAR_AREA) {
-                enter_state(STATE_CAPTURE_RED);
-                command_straight();
-            } else {
-                if (abs(s_last_ball_error) <= BALL_CENTER_DEADBAND)
-                    command_straight();
-                else
-                    command_turn(s_last_ball_error > 0 ? TURN_RIGHT : TURN_LEFT);
-            }
-            break;
-
-        case STATE_CAPTURE_RED:
-            if (ball.found) {
-                s_capture_near_frames = 0;
-                command_straight();
-                if (elapsed >= CAPTURE_TIMEOUT_MS) {
-                    stop_motors();
-                    s_capture_near_frames = 0;
-                    enter_state(STATE_SEARCH_RED);
-                }
-            } else if (s_distance_valid && distance <= CAPTURE_NEAR_CM) {
-                if (++s_capture_near_frames >= CAPTURE_CONFIRM_FRAMES) {
-                    s_capture_near_frames = 0;
-                    s_ball_captured = true;
-                    s_capture_monitor_misses = 0;
-                    stop_motors();
-                    ESP_LOGI(TAG, "red ball captured: camera lost ball, distance=%.1f cm", distance);
-                    enter_state(STATE_FIND_GOAL);
-                } else stop_motors();
-            } else {
+    case STATE_CAPTURE_RED:
+        if (ball.found)
+        {
+            s_capture_near_frames = 0;
+            command_straight();
+            if (elapsed >= CAPTURE_TIMEOUT_MS)
+            {
                 stop_motors();
                 s_capture_near_frames = 0;
-                if (elapsed >= CAPTURE_TIMEOUT_MS) enter_state(STATE_SEARCH_RED);
+                enter_state(STATE_SEARCH_RED);
             }
-            break;
-
-        case STATE_FIND_GOAL: {
-            static int seen = 0;
-            if (goal.found) {
-                if (++seen >= GOAL_CONFIRM_FRAMES) {
-                    seen = 0;
-                    stop_motors();
-                    enter_state(STATE_GOAL_ALIGN);
-                }
-            } else {
-                seen = 0;
-                enter_state(STATE_GOAL_SCAN);
-            }
-            break;
         }
+        else if (s_distance_valid && distance <= CAPTURE_NEAR_CM)
+        {
+            if (++s_capture_near_frames >= CAPTURE_CONFIRM_FRAMES)
+            {
+                s_capture_near_frames = 0;
+                s_ball_captured = true;
+                s_capture_monitor_misses = 0;
+                stop_motors();
+                ESP_LOGI(TAG, "red ball captured: camera lost ball, distance=%.1f cm", distance);
+                enter_state(STATE_FIND_GOAL);
+            }
+            else
+                stop_motors();
+        }
+        else
+        {
+            stop_motors();
+            s_capture_near_frames = 0;
+            if (elapsed >= CAPTURE_TIMEOUT_MS)
+                enter_state(STATE_SEARCH_RED);
+        }
+        break;
 
-        case STATE_GOAL_SCAN: {
-            static int scan_dir = -1;
-            if (goal.found) {
+    case STATE_FIND_GOAL:
+    {
+        static int seen = 0;
+        if (goal.found)
+        {
+            if (++seen >= GOAL_CONFIRM_FRAMES)
+            {
+                seen = 0;
                 stop_motors();
                 enter_state(STATE_GOAL_ALIGN);
-            } else if (elapsed >= GOAL_SCAN_SWITCH_MS) {
-                scan_dir = -scan_dir;
-                s_state_started_ms = now_ms();
-            } else {
-                command_turn(scan_dir < 0 ? TURN_LEFT : TURN_RIGHT);
             }
-            break;
         }
+        else
+        {
+            seen = 0;
+            enter_state(STATE_GOAL_SCAN);
+        }
+        break;
+    }
 
-        case STATE_GOAL_ALIGN:
-            if (!goal.found) {
-                stop_motors();
-                if (elapsed >= GOAL_LOST_FRAMES * 40) enter_state(STATE_FIND_GOAL);
-            } else {
-                int error = goal.cx - IMG_W / 2;
-                if (abs(error) <= GOAL_CENTER_DEADBAND) {
-                    enter_state(STATE_GOAL_APPROACH);
+    case STATE_GOAL_SCAN:
+    {
+        static int scan_dir = -1;
+        if (goal.found)
+        {
+            stop_motors();
+            enter_state(STATE_GOAL_ALIGN);
+        }
+        else if (elapsed >= GOAL_SCAN_SWITCH_MS)
+        {
+            scan_dir = -scan_dir;
+            s_state_started_ms = now_ms();
+        }
+        else
+        {
+            command_turn(scan_dir < 0 ? TURN_LEFT : TURN_RIGHT);
+        }
+        break;
+    }
+
+    case STATE_GOAL_ALIGN:
+        if (!goal.found)
+        {
+            stop_motors();
+            if (elapsed >= GOAL_LOST_FRAMES * 40)
+                enter_state(STATE_FIND_GOAL);
+        }
+        else
+        {
+            int error = goal.cx - IMG_W / 2;
+            if (abs(error) <= GOAL_CENTER_DEADBAND)
+            {
+                enter_state(STATE_GOAL_APPROACH);
+                command_straight();
+            }
+            else
+            {
+                command_turn(error > 0 ? TURN_RIGHT : TURN_LEFT);
+            }
+        }
+        break;
+
+    case STATE_GOAL_APPROACH:
+        if (!goal.found)
+        {
+            stop_motors();
+            if (elapsed >= GOAL_LOST_FRAMES * 40)
+                enter_state(STATE_FIND_GOAL);
+        }
+        else
+        {
+            int error = goal.cx - IMG_W / 2;
+            if (goal.area >= GOAL_NEAR_AREA || goal.cy >= GOAL_NEAR_Y)
+            {
+                enter_state(STATE_GOAL_PUSH);
+                command_straight();
+            }
+            else
+            {
+                if (abs(error) <= GOAL_CENTER_DEADBAND)
                     command_straight();
-                } else {
+                else
                     command_turn(error > 0 ? TURN_RIGHT : TURN_LEFT);
-                }
             }
-            break;
+        }
+        break;
 
-        case STATE_GOAL_APPROACH:
-            if (!goal.found) {
-                stop_motors();
-                if (elapsed >= GOAL_LOST_FRAMES * 40) enter_state(STATE_FIND_GOAL);
-            } else {
-                int error = goal.cx - IMG_W / 2;
-                if (goal.area >= GOAL_NEAR_AREA || goal.cy >= GOAL_NEAR_Y) {
-                    enter_state(STATE_GOAL_PUSH);
-                    command_straight();
-                } else {
-                    if (abs(error) <= GOAL_CENTER_DEADBAND)
-                        command_straight();
-                    else
-                        command_turn(error > 0 ? TURN_RIGHT : TURN_LEFT);
-                }
-            }
-            break;
-
-        case STATE_GOAL_PUSH:
-            if (elapsed < GOAL_PUSH_DURATION_MS) command_straight();
-            else {
-                stop_motors();
+    case STATE_GOAL_PUSH:
+        if (elapsed < GOAL_PUSH_DURATION_MS)
+            command_goal_push();
+        else
+        {
+            stop_motors();
+            if (!s_second_round)
+                enter_state(STATE_RETURN_AFTER_PUSH);
+            else
                 enter_state(STATE_GOAL_VERIFY);
-            }
-            break;
+        }
+        break;
 
-        case STATE_GOAL_VERIFY:
-            /* Intentionally blank for now: default to success after a short stop. */
+    case STATE_RETURN_AFTER_PUSH:
+    {
+        const uint32_t return_turn_cycle_ms = CORNER_SEARCH_TURN_MS + CORNER_SEARCH_PAUSE_MS;
+        const uint32_t return_turn_ms = RETURN_AFTER_PUSH_TURN_PULSES * return_turn_cycle_ms;
+        if (elapsed < RETURN_AFTER_PUSH_MS)
+        {
+            drive_pair(-BASE_PWM*10, -BASE_PWM*10);
+            vTaskDelay(pdMS_TO_TICKS(TRACK_DRIVE_MS));
+            brake_drive();
+            vTaskDelay(pdMS_TO_TICKS(TRACK_PAUSE_MS));
+        }
+        else if (elapsed < RETURN_AFTER_PUSH_MS + return_turn_ms)
+        {
+            command_turn(TURN_RIGHT);
+        }
+        else
+        {
             stop_motors();
-            if (elapsed >= GOAL_VERIFY_HOLD_MS) {
-                s_ball_captured = false;
-                ESP_LOGW(TAG, "GOAL_VERIFY is temporarily default-success");
-                enter_state(STATE_ALL_DONE);
-            }
-            break;
+            s_ball_captured = false;
+            s_second_round = true;
+            enter_state(STATE_SEARCH_RED);
+        }
+        break;
+    }
 
-        case STATE_ALL_DONE:
-            stop_motors();
-            break;
+    case STATE_GOAL_VERIFY:
+        /* Intentionally blank for now: default to success after a short stop. */
+        stop_motors();
+        if (elapsed >= GOAL_VERIFY_HOLD_MS)
+        {
+            s_ball_captured = false;
+            ESP_LOGW(TAG, "GOAL_VERIFY is temporarily default-success");
+            enter_state(STATE_ALL_DONE);
+        }
+        break;
 
-        case STATE_FAIL_SAFE:
-        default:
-            stop_motors();
-            break;
+    case STATE_ALL_DONE:
+        stop_motors();
+        break;
+
+    case STATE_FAIL_SAFE:
+    default:
+        stop_motors();
+        break;
     }
     (void)decoded;
 }
@@ -842,7 +1161,8 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *ctx)
 static void stream_callback(const uvc_host_stream_event_data_t *event, void *ctx)
 {
     (void)ctx;
-    if (event->type == UVC_HOST_DEVICE_DISCONNECTED) {
+    if (event->type == UVC_HOST_DEVICE_DISCONNECTED)
+    {
         s_connected = false;
         stop_motors();
         ESP_LOGW(TAG, "camera disconnected; motors stopped");
@@ -880,26 +1200,27 @@ static esp_err_t root_handler(httpd_req_t *req)
 static esp_err_t status_handler(httpd_req_t *req)
 {
     status_t status;
-    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(50)) != pdPASS) return ESP_FAIL;
+    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(50)) != pdPASS)
+        return ESP_FAIL;
     status = s_status;
     xSemaphoreGive(s_status_lock);
     char response[768];
     int length = snprintf(response, sizeof(response),
-        "{\"decoded\":%s,\"found_ball\":%s,\"found_goal\":%s,\"captured\":%s,"
-        "\"ball_x\":%d,\"ball_y\":%d,\"ball_area\":%d,\"ball_error\":%d,"
-        "\"ball_circularity\":%.3f,"
-        "\"ball_min_x\":%d,\"ball_min_y\":%d,\"ball_max_x\":%d,\"ball_max_y\":%d,"
-        "\"goal_x\":%d,\"goal_y\":%d,\"goal_area\":%d,"
-        "\"goal_min_x\":%d,\"goal_min_y\":%d,\"goal_max_x\":%d,\"goal_max_y\":%d,"
-        "\"distance_cm\":%.1f,\"state\":\"%s\"}",
-        status.decoded ? "true" : "false", status.found_ball ? "true" : "false",
-        status.found_goal ? "true" : "false", status.captured ? "true" : "false",
-        status.ball_x, status.ball_y, status.ball_area, status.ball_error,
-        status.ball_circularity,
-        status.ball_min_x, status.ball_min_y, status.ball_max_x, status.ball_max_y,
-        status.goal_x, status.goal_y, status.goal_area,
-        status.goal_min_x, status.goal_min_y, status.goal_max_x,
-        status.goal_max_y, status.distance_cm, status.state);
+                          "{\"decoded\":%s,\"found_ball\":%s,\"found_goal\":%s,\"captured\":%s,"
+                          "\"ball_x\":%d,\"ball_y\":%d,\"ball_area\":%d,\"ball_error\":%d,"
+                          "\"ball_circularity\":%.3f,"
+                          "\"ball_min_x\":%d,\"ball_min_y\":%d,\"ball_max_x\":%d,\"ball_max_y\":%d,"
+                          "\"goal_x\":%d,\"goal_y\":%d,\"goal_area\":%d,"
+                          "\"goal_min_x\":%d,\"goal_min_y\":%d,\"goal_max_x\":%d,\"goal_max_y\":%d,"
+                          "\"distance_cm\":%.1f,\"state\":\"%s\"}",
+                          status.decoded ? "true" : "false", status.found_ball ? "true" : "false",
+                          status.found_goal ? "true" : "false", status.captured ? "true" : "false",
+                          status.ball_x, status.ball_y, status.ball_area, status.ball_error,
+                          status.ball_circularity,
+                          status.ball_min_x, status.ball_min_y, status.ball_max_x, status.ball_max_y,
+                          status.goal_x, status.goal_y, status.goal_area,
+                          status.goal_min_x, status.goal_min_y, status.goal_max_x,
+                          status.goal_max_y, status.distance_cm, status.state);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, response, length);
@@ -909,29 +1230,43 @@ static void stream_task(void *arg)
 {
     httpd_req_t *req = arg;
     uint8_t *copy = heap_caps_malloc(FRAME_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!copy) { httpd_req_async_handler_complete(req); vTaskDelete(NULL); return; }
+    if (!copy)
+    {
+        httpd_req_async_handler_complete(req);
+        vTaskDelete(NULL);
+        return;
+    }
     httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     uint32_t sent_version = 0;
     esp_err_t result = ESP_OK;
-    while (result == ESP_OK) {
+    while (result == ESP_OK)
+    {
         size_t size = 0;
-        if (xSemaphoreTake(s_jpeg_lock, pdMS_TO_TICKS(100)) == pdPASS) {
-            if (s_jpeg_version != sent_version && s_jpeg_sizes[s_jpeg_index] > 0) {
+        if (xSemaphoreTake(s_jpeg_lock, pdMS_TO_TICKS(100)) == pdPASS)
+        {
+            if (s_jpeg_version != sent_version && s_jpeg_sizes[s_jpeg_index] > 0)
+            {
                 size = s_jpeg_sizes[s_jpeg_index];
                 memcpy(copy, s_jpeg_buffers[s_jpeg_index], size);
                 sent_version = s_jpeg_version;
             }
             xSemaphoreGive(s_jpeg_lock);
         }
-        if (!size) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!size)
+        {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         char header[96];
         int header_len = snprintf(header, sizeof(header),
                                   "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
                                   (unsigned)size);
         result = httpd_resp_send_chunk(req, header, header_len);
-        if (result == ESP_OK) result = httpd_resp_send_chunk(req, (const char *)copy, size);
-        if (result == ESP_OK) result = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (result == ESP_OK)
+            result = httpd_resp_send_chunk(req, (const char *)copy, size);
+        if (result == ESP_OK)
+            result = httpd_resp_send_chunk(req, "\r\n", 2);
     }
     heap_caps_free(copy);
     httpd_req_async_handler_complete(req);
@@ -942,8 +1277,10 @@ static esp_err_t stream_handler(httpd_req_t *req)
 {
     httpd_req_t *async_req = NULL;
     esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
-    if (err != ESP_OK) return err;
-    if (xTaskCreate(stream_task, "http_stream", 8192, async_req, 4, NULL) != pdPASS) {
+    if (err != ESP_OK)
+        return err;
+    if (xTaskCreate(stream_task, "http_stream", 8192, async_req, 4, NULL) != pdPASS)
+    {
         httpd_req_async_handler_complete(async_req);
         return ESP_ERR_NO_MEM;
     }
@@ -953,7 +1290,8 @@ static esp_err_t stream_handler(httpd_req_t *req)
 static void wifi_start_ap(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -996,28 +1334,39 @@ static void vision_task(void *arg)
     unsigned processed_frame_no = 0;
     bool decoded = false;
     blob_t ball = {0}, goal = {0};
-    while (s_connected) {
+    while (s_connected)
+    {
         uvc_host_frame_t *frame = NULL;
-        if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(500)) != pdPASS) {
+        if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(500)) != pdPASS)
+        {
             stop_motors();
             update_status(false, (blob_t){0}, (blob_t){0});
             continue;
         }
         publish_jpeg(frame);
         bool process_frame = (frame_no++ % VISION_PROCESS_EVERY_N_FRAMES) == 0;
-        if (process_frame) {
+        if (process_frame)
+        {
             decoded = decode_jpeg(frame->data, frame->data_len);
             ball = (blob_t){0};
             goal = (blob_t){0};
-            if (decoded) {
-                if (s_state <= STATE_CAPTURE_RED) ball = detect_blob(true, false);
-                goal = detect_blob(false, true);
+            if (decoded)
+            {
+                if (s_state <= STATE_CAPTURE_RED)
+                    ball = detect_blob(true, BLOB_SELECT_LARGEST);
+                if (s_state >= STATE_FIND_GOAL && s_state <= STATE_GOAL_PUSH)
+                    goal = detect_blob(false, s_second_round
+                                                   ? BLOB_SELECT_RIGHTMOST
+                                                   : BLOB_SELECT_LEFTMOST);
             }
         }
-        if (decoded) run_controller(decoded, ball, goal);
-        else stop_motors();
+        if (decoded)
+            run_controller(decoded, ball, goal);
+        else
+            stop_motors();
         update_status(decoded, ball, goal);
-        if (process_frame && ++processed_frame_no % 10 == 0) {
+        if (process_frame && ++processed_frame_no % 10 == 0)
+        {
             ESP_LOGI(TAG, "state=%s ball=%d(%d,%d) goal=%d(%d,%d) dist=%.1f captured=%d motor=%s",
                      state_name(s_state), ball.area, ball.cx, ball.cy, goal.area, goal.cx, goal.cy,
                      s_distance_cm, s_ball_captured, MOTOR_OUTPUT_ENABLED ? "ON" : "DRY");
@@ -1033,16 +1382,19 @@ static void vision_task(void *arg)
 static void camera_task(void *arg)
 {
     (void)arg;
-    while (true) {
+    while (true)
+    {
         const uvc_host_stream_config_t config = {
-            .event_cb = stream_callback, .frame_cb = frame_callback, .user_ctx = s_frame_q,
+            .event_cb = stream_callback,
+            .frame_cb = frame_callback,
+            .user_ctx = s_frame_q,
             .usb = {.vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID, .uvc_stream_index = 0},
             .vs_format = {.h_res = CAM_W, .v_res = CAM_H, .fps = CAM_FPS, .format = UVC_VS_FORMAT_MJPEG},
-            .advanced = {.number_of_frame_buffers = FRAME_BUFFERS, .frame_size = FRAME_SIZE,
-                         .frame_heap_caps = MALLOC_CAP_SPIRAM, .number_of_urbs = 6, .urb_size = 16 * 1024},
+            .advanced = {.number_of_frame_buffers = FRAME_BUFFERS, .frame_size = FRAME_SIZE, .frame_heap_caps = MALLOC_CAP_SPIRAM, .number_of_urbs = 6, .urb_size = 16 * 1024},
         };
         ESP_LOGI(TAG, "opening UVC camera GPIO19=D- GPIO20=D+");
-        if (uvc_host_stream_open(&config, pdMS_TO_TICKS(5000), &s_stream) != ESP_OK) {
+        if (uvc_host_stream_open(&config, pdMS_TO_TICKS(5000), &s_stream) != ESP_OK)
+        {
             ESP_LOGW(TAG, "camera open failed; retrying");
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
@@ -1052,13 +1404,16 @@ static void camera_task(void *arg)
         ESP_LOGI(TAG, "camera streaming %dx%d@%d MJPEG", CAM_W, CAM_H, CAM_FPS);
         s_vision_task_running = true;
         if (xTaskCreatePinnedToCore(vision_task, "vision", 16384, NULL,
-                                    USB_PRIORITY - 2, NULL, 1) != pdPASS) {
+                                    USB_PRIORITY - 2, NULL, 1) != pdPASS)
+        {
             s_vision_task_running = false;
             s_connected = false;
             stop_motors();
         }
-        while (s_connected) vTaskDelay(pdMS_TO_TICKS(200));
-        while (s_vision_task_running) vTaskDelay(pdMS_TO_TICKS(10));
+        while (s_connected)
+            vTaskDelay(pdMS_TO_TICKS(200));
+        while (s_vision_task_running)
+            vTaskDelay(pdMS_TO_TICKS(10));
         uvc_host_stream_close(s_stream);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -1074,7 +1429,8 @@ static void uvc_event_callback(const uvc_host_driver_event_data_t *event, void *
 static void usb_lib_task(void *arg)
 {
     (void)arg;
-    while (true) {
+    while (true)
+    {
         uint32_t flags;
         usb_host_lib_handle_events(portMAX_DELAY, &flags);
     }
@@ -1101,8 +1457,11 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_host_install(&usb_config));
     xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, USB_PRIORITY, NULL);
     const uvc_host_driver_config_t uvc_config = {
-        .driver_task_stack_size = 4096, .driver_task_priority = USB_PRIORITY + 1,
-        .xCoreID = tskNO_AFFINITY, .create_background_task = true, .event_cb = uvc_event_callback,
+        .driver_task_stack_size = 4096,
+        .driver_task_priority = USB_PRIORITY + 1,
+        .xCoreID = tskNO_AFFINITY,
+        .create_background_task = true,
+        .event_cb = uvc_event_callback,
     };
     ESP_ERROR_CHECK(uvc_host_install(&uvc_config));
     xTaskCreate(ultrasonic_task, "ultrasonic", 4096, NULL, 3, NULL);
