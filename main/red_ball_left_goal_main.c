@@ -25,6 +25,7 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 #include "tjpgd.h"
+#include "teal_ball_color.h"
 
 #define CAM_W 640
 #define CAM_H 480
@@ -38,11 +39,11 @@
 #define START_BOOST_FRAMES 1
 #define BASE_PWM 44
 #define START_BOOST_PWM 16
-#define TRACK_DRIVE_FRAMES 1
-#define TRACK_PAUSE_FRAMES 2
+#define TRACK_DRIVE_MS 35
+#define TRACK_PAUSE_MS 15
 #define CORNER_SEARCH_PWM 33
-#define CORNER_SEARCH_TURN_FRAMES 1
-#define CORNER_SEARCH_PAUSE_FRAMES 3
+#define CORNER_SEARCH_TURN_MS 22
+#define CORNER_SEARCH_PAUSE_MS 38
 
 /* Existing motor wiring. */
 #define STBY_PIN 10
@@ -94,6 +95,12 @@
 #define CAPTURE_MONITOR_MISSES 30
 #define BALL_NEAR_AREA 180
 
+/* Approach-red tuning: longer straight pulses when the ball is far away. */
+#define APPROACH_FAR_DRIVE_MS 80
+#define APPROACH_FAR_PAUSE_MS 15
+/* Conservative threshold: switch to the near/normal pulse early. */
+#define APPROACH_NEAR_AREA 120
+
 #define SEARCH_SWITCH_MS 1200
 #define GOAL_SCAN_SWITCH_MS 1400
 #define GOAL_CONFIRM_FRAMES 3
@@ -102,6 +109,11 @@
 #define GOAL_NEAR_Y 280
 #define GOAL_PUSH_DURATION_MS 700
 #define GOAL_VERIFY_HOLD_MS 350
+#define RETURN_AFTER_PUSH_MS 3000
+
+/* Goal-push tuning: one fixed straight pulse and pause for this state. */
+#define GOAL_PUSH_DRIVE_MS 280
+#define GOAL_PUSH_PAUSE_MS 20
 
 #define FRAME_BUFFERS 3
 #define FRAME_SIZE (CAM_W * CAM_H * 2)
@@ -145,6 +157,7 @@ typedef enum {
     STATE_GOAL_ALIGN,
     STATE_GOAL_APPROACH,
     STATE_GOAL_PUSH,
+    STATE_RETURN_AFTER_PUSH,
     STATE_GOAL_VERIFY,
     STATE_ALL_DONE,
     STATE_FAIL_SAFE
@@ -171,6 +184,7 @@ static status_t s_status;
 static state_t s_state = STATE_IDLE;
 static uint32_t s_state_started_ms;
 static bool s_ball_captured;
+static bool s_second_round;
 static int s_capture_monitor_misses;
 static int s_capture_near_frames;
 static int s_last_ball_error;
@@ -188,6 +202,7 @@ static const char *state_name(state_t state)
         case STATE_GOAL_ALIGN: return "GOAL_ALIGN";
         case STATE_GOAL_APPROACH: return "GOAL_APPROACH";
         case STATE_GOAL_PUSH: return "GOAL_PUSH";
+        case STATE_RETURN_AFTER_PUSH: return "RETURN_AFTER_PUSH";
         case STATE_GOAL_VERIFY: return "GOAL_VERIFY_DEFAULT_SUCCESS";
         case STATE_ALL_DONE: return "ALL_DONE";
         case STATE_FAIL_SAFE: return "FAIL_SAFE";
@@ -357,25 +372,43 @@ typedef enum {
     TURN_RIGHT = 1
 } turn_direction_t;
 
-/* Public commands. PWM and pulse timing are fixed from the tested programs. */
+/* Public commands. Motion duration is controlled directly in milliseconds. */
 static void command_straight(void)
 {
     motion_begin(MOTION_STRAIGHT, 0);
-    const unsigned cycle = TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES;
-    const unsigned phase = s_motion_phase++ % cycle;
-    if (phase < TRACK_DRIVE_FRAMES) drive_straight_fixed();
-    else brake_drive();
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(TRACK_DRIVE_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(TRACK_PAUSE_MS));
 }
 
 static void command_turn(turn_direction_t direction)
 {
     motion_begin(MOTION_TURN, direction);
-    const unsigned cycle = CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES;
-    const unsigned phase = s_motion_phase++ % cycle;
-    if (phase < CORNER_SEARCH_TURN_FRAMES)
-        drive_turn_pulse(direction * CORNER_SEARCH_PWM, phase == 0);
-    else
-        brake_drive();
+    drive_turn_pulse(direction * CORNER_SEARCH_PWM, true);
+    vTaskDelay(pdMS_TO_TICKS(CORNER_SEARCH_TURN_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(CORNER_SEARCH_PAUSE_MS));
+}
+
+static void command_goal_push(void)
+{
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(GOAL_PUSH_DRIVE_MS));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(GOAL_PUSH_PAUSE_MS));
+}
+
+static void command_approach_red(const blob_t *ball)
+{
+    const bool near = ball && ball->found && ball->area >= APPROACH_NEAR_AREA;
+    const int drive_ms = near ? TRACK_DRIVE_MS : APPROACH_FAR_DRIVE_MS;
+    const int pause_ms = near ? TRACK_PAUSE_MS : APPROACH_FAR_PAUSE_MS;
+
+    drive_straight_fixed();
+    vTaskDelay(pdMS_TO_TICKS(drive_ms));
+    brake_drive();
+    vTaskDelay(pdMS_TO_TICKS(pause_ms));
 }
 
 static void stop_motors(void)
@@ -421,16 +454,6 @@ static bool decode_jpeg(const uint8_t *data, size_t size)
     return jd_decomp(&decoder, jpeg_output, 1) == JDR_OK;
 }
 
-static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
-{
-    int red = r;
-    return red >= RED_R_MIN &&
-           red - (int)g >= RED_RG_MIN_DIFF &&
-           red - (int)b >= RED_RB_MIN_DIFF &&
-           red * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
-           red * 100 >= (int)b * RED_DOMINANCE_PERCENT;
-}
-
 static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     int blue = b;
@@ -439,6 +462,20 @@ static bool is_blue_rgb(uint8_t r, uint8_t g, uint8_t b)
            blue - (int)g >= BLUE_BG_MIN_DIFF &&
            blue * 100 >= (int)r * BLUE_DOMINANCE_PERCENT &&
            blue * 100 >= (int)g * BLUE_DOMINANCE_PERCENT;
+}
+
+static bool is_red_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return r >= RED_R_MIN &&
+           (int)r - (int)g >= RED_RG_MIN_DIFF &&
+           (int)r - (int)b >= RED_RB_MIN_DIFF &&
+           (int)r * 100 >= (int)g * RED_DOMINANCE_PERCENT &&
+           (int)r * 100 >= (int)b * RED_DOMINANCE_PERCENT;
+}
+
+static bool is_ball_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return is_red_rgb(r, g, b) || is_teal_ball_rgb(r, g, b);
 }
 
 static blob_t flood_blob(int sx, int sy)
@@ -501,7 +538,9 @@ static blob_t detect_blob(bool red, bool choose_leftmost)
             int p = (y * IMG_W + x) * 3;
             bool selected;
             if (red) {
-                selected = is_red_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
+                selected = s_second_round
+                    ? is_teal_ball_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2])
+                    : is_ball_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
             } else {
                 selected = is_blue_rgb(s_rgb[p], s_rgb[p + 1], s_rgb[p + 2]);
             }
@@ -642,6 +681,7 @@ static void run_controller(bool decoded, blob_t ball, blob_t goal)
     switch (s_state) {
         case STATE_IDLE:
             s_ball_captured = false;
+            s_second_round = false;
             s_capture_monitor_misses = 0;
             enter_state(STATE_SEARCH_RED);
             break;
@@ -683,7 +723,7 @@ static void run_controller(bool decoded, blob_t ball, blob_t goal)
                 if (++aligned_frames >= BALL_ALIGN_CONFIRM_FRAMES) {
                     aligned_frames = 0;
                     enter_state(STATE_APPROACH_RED);
-                    command_straight();
+                    command_approach_red(&ball);
                 }
             } else {
                 aligned_frames = 0;
@@ -707,10 +747,10 @@ static void run_controller(bool decoded, blob_t ball, blob_t goal)
             s_last_ball_error = ball.cx - BALL_TARGET_X;
             if (ball.area >= BALL_NEAR_AREA) {
                 enter_state(STATE_CAPTURE_RED);
-                command_straight();
+                command_approach_red(&ball);
             } else {
                 if (abs(s_last_ball_error) <= BALL_CENTER_DEADBAND)
-                    command_straight();
+                    command_approach_red(&ball);
                 else
                     command_turn(s_last_ball_error > 0 ? TURN_RIGHT : TURN_LEFT);
             }
@@ -804,10 +844,25 @@ static void run_controller(bool decoded, blob_t ball, blob_t goal)
             break;
 
         case STATE_GOAL_PUSH:
-            if (elapsed < GOAL_PUSH_DURATION_MS) command_straight();
+            if (elapsed < GOAL_PUSH_DURATION_MS) command_goal_push();
             else {
                 stop_motors();
-                enter_state(STATE_GOAL_VERIFY);
+                if (!s_second_round) enter_state(STATE_RETURN_AFTER_PUSH);
+                else enter_state(STATE_GOAL_VERIFY);
+            }
+            break;
+
+        case STATE_RETURN_AFTER_PUSH:
+            if (elapsed < RETURN_AFTER_PUSH_MS) {
+                drive_pair(-BASE_PWM, -BASE_PWM);
+                vTaskDelay(pdMS_TO_TICKS(TRACK_DRIVE_MS));
+                brake_drive();
+                vTaskDelay(pdMS_TO_TICKS(TRACK_PAUSE_MS));
+            } else {
+                stop_motors();
+                s_ball_captured = false;
+                s_second_round = true;
+                enter_state(STATE_SEARCH_RED);
             }
             break;
 
@@ -1012,7 +1067,7 @@ static void vision_task(void *arg)
             if (decoded) {
                 if (s_state <= STATE_CAPTURE_RED) ball = detect_blob(true, false);
                 if (s_state >= STATE_FIND_GOAL && s_state <= STATE_GOAL_PUSH)
-                    goal = detect_blob(false, true);
+                    goal = detect_blob(false, !s_second_round);
             }
         }
         if (decoded) run_controller(decoded, ball, goal);
